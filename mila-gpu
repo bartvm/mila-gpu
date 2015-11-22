@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+import datetime
+import logging
+import os
+import pwd
+from collections import Counter
+from itertools import compress
+from urlparse import urljoin, urlsplit
+
+import click
+import requests
+from itsdangerous import json
+from jmespath import search
+from texttable import Texttable
+
+VERBOSITY = {
+    0: logging.WARNING,
+    1: logging.INFO,
+    2: logging.DEBUG
+}
+
+
+def get(ctx, query, params={}):
+    r = requests.get(
+        urljoin(ctx.obj['API'], query),
+        headers={'Content-Type': 'application/json'},
+        params={'q': json.dumps(params)}
+    )
+    return r
+
+
+def post(ctx, query, data={}):
+    r = requests.post(
+        urljoin(ctx.obj['API'], query),
+        headers={'Content-Type': 'application/json'},
+        data=json.dumps(data)
+    )
+    return r
+
+
+def non_empty(ctx, param, value):
+    if not value:
+        raise click.BadParameter('not given')
+    return value
+
+
+@click.group()
+@click.version_option(version=0.1)
+@click.option('--server', envvar='RESERVATION_SERVER', callback=non_empty,
+              help='The GPU reservation server to connect to, can also be set '
+                   'using the RESERVATION_SERVER environment variable')
+@click.option('-v', '--verbose', count=True,
+              help='Verbosity level, can be repeated for higher verbosity')
+@click.pass_context
+def cli(ctx, server, verbose):
+    # Determine the API endpoint
+    if not urlsplit(server).scheme:
+        server = '//' + server
+    ctx.obj['API'] = urljoin(urlsplit(server, scheme='http').geturl(), 'api/')
+
+    # Configure logging
+    logging.basicConfig()
+    ctx.obj['LOGGER'] = logging.getLogger(__name__)
+    ctx.obj['LOGGER'].setLevel(VERBOSITY[verbose])
+
+
+@cli.command()
+@click.pass_context
+def status(ctx):
+    """Show status of all GPUs"""
+    # TODO This should really be done in SQL on the server side
+    gpus = get(ctx, 'gpu').json()
+    names = search('objects[].model.name', gpus)
+    availability = search('objects[].available', gpus)
+    counts = Counter(names)
+    available_counts = Counter(compress(names, availability))
+
+    # Construct a table with results
+    table = Texttable()
+    table.set_deco(Texttable.HEADER)
+    table.add_rows(
+        [['Model', 'Available', 'Total']] +
+        [[model, available_counts[model], counts[model]] for model in counts]
+    )
+    click.echo(table.draw())
+
+
+def strip_host(ctx, param, value):
+    """Extract the leaf domain e.g. leto02 from leto02.iro.umontreal.ca"""
+    if not isinstance(value, basestring):
+        raise click.BadParameter('Host not given or invalid')
+    return value.split('.', 1)[0]
+
+
+def get_user_id(ctx, username):
+    # Get the user ID
+    ctx.obj['LOGGER'].info('Finding user ID for {}'.format(username))
+    r = get(ctx, 'user', {'filters': [
+        {'name': 'username', 'op': 'eq', 'val': username}
+    ], 'single': True})
+    if not r.status_code == 200:
+        raise click.UsageError('User {} does not exist'.format(username))
+    user_id = r.json()['id']
+    ctx.obj['LOGGER'].debug('Found user ID {}'.format(user_id))
+    return user_id
+
+
+@cli.command()
+@click.pass_context
+@click.argument('device')
+@click.option('-h', '--host', envvar='HOSTNAME', callback=strip_host,
+              help='The host on which to reserve a GPU e.g. bart12. Defaults '
+                   'to the current host.')
+@click.option('-u', '--username', envvar='USER',
+              help='The username with which to make the reservation. Defaults '
+                   'to the current user.')
+@click.option('-n', '--note', help='A note about the reservation, for example '
+                                   'its priority.')
+def reserve(ctx, device, host, username, note):
+    """Reserve a GPU"""
+    # Get the GPU ID
+    ctx.obj['LOGGER'].info('Querying GPU ID for device {} on host {}'
+                           .format(device, host))
+    r = get(ctx, 'gpu', {'filters': [
+        {'name': 'host__name', 'op': 'has', 'val': host},
+        {'name': 'device', 'op': 'eq', 'val': device}
+    ], 'single': True})
+    if not r.status_code == 200:
+        raise click.UsageError('Device {} on host {} does not exist'
+                               .format(device, host))
+    gpu_id = r.json()['id']
+    ctx.obj['LOGGER'].debug('Found GPU ID {}'.format(gpu_id))
+
+    user_id = get_user_id(ctx, username)
+
+    # Reservation policy: From noon till next day noon
+    noon = datetime.datetime.combine(datetime.datetime.now(),
+                                     datetime.time(hour=12))
+    r = post(ctx, 'reservation', {
+        'start': noon.isoformat(),
+        'end': (noon + datetime.timedelta(1)).isoformat(),
+        'gpu_id': gpu_id,
+        'user_id': user_id,
+        'note': note
+    })
+
+    # Error handling
+    if not r.status_code == 201:
+        raise click.UsageError('Conflicting reservations')
+    click.echo('Reservation succesful')
+
+
+@cli.command()
+@click.pass_context
+@click.option('-u', '--username', envvar='USER',
+              help='The user of which to show reservations. Defaults '
+                   'to the current user.')
+def reservations(ctx, username):
+    """Display current GPU reservations."""
+    user_id = get_user_id(ctx, username)
+
+    # Get all reservations that are valid right now
+    r = get(ctx, 'reservation', {
+        'filters': [{'name': 'user_id', 'op': 'eq', 'val': user_id},
+                    {'name': 'end', 'op': '>',
+                     'val': datetime.datetime.now().isoformat()}]
+    })
+
+    reservations = r.json()['objects']
+    if not reservations:
+        click.echo('No reservations found')
+    else:
+        table = Texttable()
+        table.set_deco(Texttable.HEADER)
+        table.header(['Host', 'Device', 'Until'])
+        for reservation in reservations:
+            gpu_id = reservation['gpu_id']
+            host = get(ctx, 'gpu/{}'.format(gpu_id)).json()['host']
+            table.add_row([host['name'],
+                           reservation['gpu']['device'],
+                           reservation['end']])
+        click.echo(table.draw())
+
+
+@cli.command('add-user')
+@click.pass_context
+@click.option('--username', prompt=True,
+              default=lambda: os.environ.get('USER', ''),
+              help='The UNIX username to add.')
+@click.option('--name', prompt='Name',
+              default=lambda: pwd.getpwuid(os.getuid())[4],
+              help='The full name of the user to add.')
+def add_user(ctx, username, name):
+    """Add a user to the system."""
+    r = post(ctx, 'user', {'username': username, 'name': name})
+
+    # Error handling
+    if not r.status_code == 201:
+        raise click.UsageError('User already exists')
+    click.echo('User added')
+
+if __name__ == '__main__':
+    cli(obj={})

@@ -22,10 +22,12 @@ class Reservation(db.Model):
     end = db.Column(db.DateTime, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     gpu_id = db.Column(db.Integer, db.ForeignKey('gpu.id'), nullable=False)
+    note = db.Column(db.String(300))
 
     gpu = db.relationship('GPU', backref='reservations')
 
     __table_args__ = (db.CheckConstraint('start < end'),)
+
 
 # Guarantee integrity of the database by not allowing overlapping reservations
 no_overlap = DDL("""
@@ -138,14 +140,13 @@ class User(db.Model):
     __tablename__ = 'user'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(10), unique=True, nullable=False)
-    given_name = db.Column(db.String(100))
-    surname = db.Column(db.String(100))
+    name = db.Column(db.String(100))
 
     reservations = db.relationship('Reservation', backref='user')
 
     def __str__(self):
-        if self.given_name and self.surname:
-            return u'{} {}'.format(self.given_name, self.surname)
+        if self.name:
+            return self.name
         else:
             return self.username
 
@@ -160,10 +161,11 @@ admin.add_view(sqla.ModelView(Reservation, db.session))
 admin.add_view(sqla.ModelView(GPU, db.session, 'GPU'))
 admin.add_view(sqla.ModelView(Model, db.session, 'Model'))
 
-# Create the API to make reservations and search GPUs
 manager = APIManager(app, flask_sqlalchemy_db=db)
-manager.create_api(Reservation, methods=['POST'])
-manager.create_api(GPU, methods=['GET'], include_methods=['available'])
+manager.create_api(Reservation, methods=['GET', 'POST'])
+manager.create_api(GPU, methods=['GET'], include_methods=['available'],
+                   results_per_page=0, allow_functions=True)
+manager.create_api(User, methods=['GET', 'POST'])
 
 if __name__ == "__main__":
     app.run()

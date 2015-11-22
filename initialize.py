@@ -224,7 +224,7 @@ def initialize():
     ]
 
     users = [
-        ('vanmerb', 'Bart', u'van Merriënboer')
+        ('vanmerb', u'Bart van Merriënboer')
     ]
 
     unreservable = [('leto08', 'gpu1'), ('ceylon', 'gpu0'), ('ceylon', 'gpu2')]
@@ -275,11 +275,10 @@ def initialize():
         db.session.add(gpu_entry)
 
     for user in users:
-        username, given_name, surname = user
+        username, name = user
         user_entry = User()
         user_entry.username = username
-        user_entry.given_name = given_name
-        user_entry.surname = surname
+        user_entry.name = name
 
         db.session.add(user_entry)
 
